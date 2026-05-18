@@ -137,85 +137,18 @@ def fetch_data():
     return spot, df
 
 
-# ── Plots ─────────────────────────────────────────────────────────────────────
-def plot_all(spot, df):
+# ── Dashboard builder ─────────────────────────────────────────────────────────
+def build_dashboard(spot, df):
+    from plotly.io import to_html
     expiries = sorted(df["expiry"].unique(), key=lambda e: df.loc[df["expiry"]==e,"T"].iloc[0])
+    run_time = datetime.now().strftime("%Y-%m-%d %H:%M")
+    n_exp    = len(expiries)
+    atm_ivs  = []
 
-    # ── 1. 3-D surface ────────────────────────────────────────────────────────
-    # Interpolate onto a regular grid for a clean surface
-    K_vals  = np.linspace(df["strike"].min(), df["strike"].max(), 80)
-    T_vals  = np.linspace(df["T"].min(),      df["T"].max(),      40)
-    KK, TT  = np.meshgrid(K_vals, T_vals)
-    ZZ      = griddata(
-        (df["strike"].values, df["T"].values),
-        df["IV"].values,
-        (KK, TT),
-        method="linear"
-    )
-
-    fig3d = go.Figure(go.Surface(
-        x=K_vals, y=T_vals, z=ZZ,
-        colorscale="Viridis",
-        colorbar=dict(title="IV", tickformat=".0%"),
-        hovertemplate="Strike: %{x:,.0f}<br>Maturity: %{y:.3f}y<br>IV: %{z:.1%}<extra></extra>",
-    ))
-    fig3d.update_layout(
-        title="SPX Implied Volatility Surface",
-        scene=dict(
-            xaxis=dict(title="Strike"),
-            yaxis=dict(title="Maturity (years)"),
-            zaxis=dict(title="Implied Volatility", tickformat=".0%"),
-            camera=dict(eye=dict(x=1.8, y=-1.6, z=0.8)),
-        ),
-        height=700, margin=dict(l=0, r=0, t=60, b=0),
-    )
-    fig3d.write_html("iv_surface_3d.html")
-    print("Saved → iv_surface_3d.html")
-    fig3d.show()
-
-    # ── 2. Smile per expiry ───────────────────────────────────────────────────
-    n_cols = min(3, len(expiries))
-    n_rows = (len(expiries) + n_cols - 1) // n_cols
-    fig_smile = make_subplots(
-        rows=n_rows, cols=n_cols,
-        subplot_titles=[f"{e} ({df.loc[df['expiry']==e,'days'].iloc[0]}d)" for e in expiries],
-    )
-    colors = ["#1f77b4","#ff7f0e","#2ca02c","#d62728","#9467bd",
-              "#8c564b","#e377c2","#7f7f7f","#bcbd22","#17becf","#aec7e8","#ffbb78"]
-
-    for idx, exp in enumerate(expiries):
-        sub = df[df["expiry"] == exp].sort_values("moneyness")
-        r, c = idx // n_cols + 1, idx % n_cols + 1
-        fig_smile.add_trace(go.Scatter(
-            x=sub["moneyness"], y=sub["IV"],
-            mode="lines+markers", marker=dict(size=5),
-            line=dict(color=colors[idx % len(colors)]),
-            name=exp, showlegend=False,
-            hovertemplate="K/S: %{x:.3f}<br>IV: %{y:.1%}<extra></extra>",
-        ), row=r, col=c)
-        # ATM marker
-        atm = sub.iloc[(sub["moneyness"] - 1.0).abs().argsort()[:1]]
-        fig_smile.add_trace(go.Scatter(
-            x=atm["moneyness"], y=atm["IV"],
-            mode="markers", marker=dict(size=10, color="red", symbol="star"),
-            showlegend=(idx == 0), name="ATM",
-            hovertemplate="ATM IV: %{y:.1%}<extra></extra>",
-        ), row=r, col=c)
-
-    fig_smile.update_xaxes(title_text="Moneyness (K/S)")
-    fig_smile.update_yaxes(title_text="IV", tickformat=".0%")
-    fig_smile.update_layout(
-        title="SPX Volatility Smile by Expiry",
-        height=300 * n_rows, showlegend=True,
-    )
-    fig_smile.write_html("iv_smile_by_expiry.html")
-    print("Saved → iv_smile_by_expiry.html")
-    fig_smile.show()
-
-    # ── 3. ATM term structure ─────────────────────────────────────────────────
+    # ── ATM summary per expiry ────────────────────────────────────────────────
     atm_rows = []
     for exp in expiries:
-        sub = df[df["expiry"] == exp]
+        sub     = df[df["expiry"] == exp]
         closest = sub.iloc[(sub["moneyness"] - 1.0).abs().argsort()[:1]]
         atm_rows.append({
             "expiry": exp,
@@ -224,6 +157,67 @@ def plot_all(spot, df):
         })
     atm_df = pd.DataFrame(atm_rows).sort_values("days")
 
+    # ── 1. 3-D surface ────────────────────────────────────────────────────────
+    K_vals = np.linspace(df["strike"].min(), df["strike"].max(), 80)
+    T_vals = np.linspace(df["T"].min(),      df["T"].max(),      40)
+    KK, TT = np.meshgrid(K_vals, T_vals)
+    ZZ     = griddata((df["strike"].values, df["T"].values),
+                      df["IV"].values, (KK, TT), method="linear")
+
+    fig3d = go.Figure(go.Surface(
+        x=K_vals, y=T_vals, z=ZZ,
+        colorscale="Viridis",
+        colorbar=dict(title="IV", tickformat=".0%", x=1.0),
+        hovertemplate="Strike: %{x:,.0f}<br>Maturity: %{y:.2f}y<br>IV: %{z:.1%}<extra></extra>",
+    ))
+    fig3d.update_layout(
+        title=None,
+        scene=dict(
+            xaxis=dict(title="Strike"),
+            yaxis=dict(title="Maturity (years)"),
+            zaxis=dict(title="Implied Volatility", tickformat=".0%"),
+            camera=dict(eye=dict(x=1.8, y=-1.6, z=0.8)),
+        ),
+        height=620, margin=dict(l=0, r=0, t=10, b=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    plotlyjs = to_html(fig3d, full_html=False, include_plotlyjs=True)
+    # Split out just the <script src> tag plotly injects and the div
+    html_3d = plotlyjs
+
+    # ── 2. Smile grid ─────────────────────────────────────────────────────────
+    n_cols     = min(3, n_exp)
+    n_rows     = (n_exp + n_cols - 1) // n_cols
+    colors     = ["#1f77b4","#ff7f0e","#2ca02c","#d62728","#9467bd",
+                  "#8c564b","#e377c2","#7f7f7f","#bcbd22","#17becf","#aec7e8","#ffbb78"]
+    fig_smile  = make_subplots(
+        rows=n_rows, cols=n_cols,
+        subplot_titles=[f"{e} ({df.loc[df['expiry']==e,'days'].iloc[0]}d)" for e in expiries],
+    )
+    for idx, exp in enumerate(expiries):
+        sub = df[df["expiry"] == exp].sort_values("moneyness")
+        r, c = idx // n_cols + 1, idx % n_cols + 1
+        fig_smile.add_trace(go.Scatter(
+            x=sub["moneyness"], y=sub["IV"],
+            mode="lines+markers", marker=dict(size=4),
+            line=dict(color=colors[idx % len(colors)]),
+            name=exp, showlegend=False,
+            hovertemplate="K/S: %{x:.3f}<br>IV: %{y:.1%}<extra></extra>",
+        ), row=r, col=c)
+        atm = sub.iloc[(sub["moneyness"]-1.0).abs().argsort()[:1]]
+        fig_smile.add_trace(go.Scatter(
+            x=atm["moneyness"], y=atm["IV"], mode="markers",
+            marker=dict(size=9, color="red", symbol="star"),
+            showlegend=False,
+            hovertemplate="ATM IV: %{y:.1%}<extra></extra>",
+        ), row=r, col=c)
+    fig_smile.update_xaxes(title_text="Moneyness (K/S)")
+    fig_smile.update_yaxes(title_text="IV", tickformat=".0%")
+    fig_smile.update_layout(height=290 * n_rows, margin=dict(t=40, b=20),
+                            paper_bgcolor="rgba(0,0,0,0)")
+    html_smile = to_html(fig_smile, full_html=False, include_plotlyjs=False)  # reuses embedded js
+
+    # ── 3. Term structure ─────────────────────────────────────────────────────
     fig_ts = go.Figure(go.Scatter(
         x=atm_df["days"], y=atm_df["IV_atm"],
         mode="lines+markers",
@@ -234,14 +228,220 @@ def plot_all(spot, df):
         name="ATM IV",
     ))
     fig_ts.update_layout(
-        title="SPX ATM Implied Volatility — Term Structure",
         xaxis=dict(title="Days to Expiry"),
         yaxis=dict(title="ATM Implied Volatility", tickformat=".0%"),
-        height=450,
+        height=380, margin=dict(t=10, b=40),
+        paper_bgcolor="rgba(0,0,0,0)",
     )
-    fig_ts.write_html("iv_term_structure.html")
-    print("Saved → iv_term_structure.html")
-    fig_ts.show()
+    html_ts = to_html(fig_ts, full_html=False, include_plotlyjs=False)  # reuses embedded js
+
+    # ── Stats for summary card ────────────────────────────────────────────────
+    near_atm_iv  = atm_df.iloc[0]["IV_atm"]
+    far_atm_iv   = atm_df.iloc[-1]["IV_atm"]
+    ts_slope     = "upward (contango)" if far_atm_iv > near_atm_iv else "inverted (backwardation)"
+    skew_exp     = expiries[len(expiries)//2]
+    skew_sub     = df[df["expiry"]==skew_exp]
+    otm_put_iv   = skew_sub[skew_sub["moneyness"] <= 0.95]["IV"].mean()
+    otm_call_iv  = skew_sub[skew_sub["moneyness"] >= 1.05]["IV"].mean()
+    skew_val     = otm_put_iv - otm_call_iv if not np.isnan(otm_put_iv) and not np.isnan(otm_call_iv) else 0
+
+    # ── Assemble HTML ─────────────────────────────────────────────────────────
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>SPX Implied Volatility Surface — Dashboard</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+          background: #f4f6f9; color: #1a1a2e; }}
+  .header {{ background: linear-gradient(135deg, #1a1a2e 0%, #16213e 60%, #0f3460 100%);
+             color: white; padding: 32px 40px 24px; }}
+  .header h1 {{ font-size: 1.9rem; font-weight: 700; letter-spacing: -0.5px; }}
+  .header p  {{ margin-top: 6px; opacity: 0.75; font-size: 0.9rem; }}
+  .container {{ max-width: 1400px; margin: 0 auto; padding: 28px 32px; }}
+  .cards {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 28px; }}
+  .card {{ background: white; border-radius: 12px; padding: 20px 24px;
+           box-shadow: 0 2px 8px rgba(0,0,0,0.07); }}
+  .card .label {{ font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.8px;
+                  color: #888; margin-bottom: 6px; }}
+  .card .value {{ font-size: 1.6rem; font-weight: 700; color: #1a1a2e; }}
+  .card .sub   {{ font-size: 0.8rem; color: #aaa; margin-top: 4px; }}
+  .section {{ background: white; border-radius: 12px; padding: 24px 28px;
+              box-shadow: 0 2px 8px rgba(0,0,0,0.07); margin-bottom: 24px; }}
+  .section h2 {{ font-size: 1.1rem; font-weight: 600; margin-bottom: 4px; color: #1a1a2e; }}
+  .section .subtitle {{ font-size: 0.85rem; color: #888; margin-bottom: 18px; }}
+  .method-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }}
+  .method-box {{ background: #f8f9fc; border-radius: 8px; padding: 18px 20px; }}
+  .method-box h3 {{ font-size: 0.85rem; font-weight: 600; color: #0f3460;
+                    text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 10px; }}
+  .method-box p, .method-box li {{ font-size: 0.84rem; line-height: 1.65; color: #444; }}
+  .method-box ul {{ padding-left: 18px; }}
+  .method-box li {{ margin-bottom: 4px; }}
+  code {{ background: #eef2ff; color: #3730a3; padding: 2px 6px;
+          border-radius: 4px; font-size: 0.82rem; }}
+  .interp-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 4px; }}
+  .interp-box {{ background: #f8f9fc; border-radius: 8px; padding: 16px 18px; }}
+  .interp-box h3 {{ font-size: 0.82rem; font-weight: 700; color: #0f3460;
+                    text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }}
+  .interp-box p {{ font-size: 0.83rem; line-height: 1.6; color: #444; }}
+  .tag {{ display: inline-block; background: #e0e7ff; color: #3730a3;
+          font-size: 0.72rem; font-weight: 600; padding: 2px 8px;
+          border-radius: 99px; margin-bottom: 6px; }}
+  hr {{ border: none; border-top: 1px solid #eee; margin: 0; }}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>SPX Implied Volatility Surface</h1>
+  <p>Live options chain analysis &nbsp;·&nbsp; Generated {run_time} ET &nbsp;·&nbsp;
+     Spot: <strong>{spot:,.2f}</strong> &nbsp;·&nbsp;
+     {n_exp} expiries &nbsp;·&nbsp; {len(df):,} data points</p>
+</div>
+
+<div class="container">
+
+  <!-- Summary cards -->
+  <div class="cards">
+    <div class="card">
+      <div class="label">Spot (SPX)</div>
+      <div class="value">{spot:,.0f}</div>
+      <div class="sub">S&amp;P 500 Index</div>
+    </div>
+    <div class="card">
+      <div class="label">Near-term ATM IV</div>
+      <div class="value">{near_atm_iv:.1%}</div>
+      <div class="sub">{atm_df.iloc[0]['days']}d expiry</div>
+    </div>
+    <div class="card">
+      <div class="label">Long-dated ATM IV</div>
+      <div class="value">{far_atm_iv:.1%}</div>
+      <div class="sub">{atm_df.iloc[-1]['days']}d expiry</div>
+    </div>
+    <div class="card">
+      <div class="label">Term Structure</div>
+      <div class="value" style="font-size:1.1rem;padding-top:6px">{ts_slope.split()[0].title()}</div>
+      <div class="sub">{ts_slope}</div>
+    </div>
+  </div>
+
+  <!-- Methodology -->
+  <div class="section">
+    <h2>Methodology &amp; Calculations</h2>
+    <div class="subtitle">How the implied volatility surface is constructed from raw options data</div>
+    <div class="method-grid">
+      <div class="method-box">
+        <h3>Data Pipeline</h3>
+        <ul>
+          <li><strong>Source:</strong> Live SPX options chain via <code>yfinance</code></li>
+          <li><strong>Expiry selection:</strong> 10 target maturities spread from 14 to 365 days, picking the nearest available expiry to each target so the term structure spans the full curve</li>
+          <li><strong>Liquidity filter:</strong> Only options with <code>volume ≥ {MIN_VOLUME}</code> are used, removing stale/phantom quotes</li>
+          <li><strong>Strike filter:</strong> Moneyness <code>{MONEYNESS_LO:.0%} – {MONEYNESS_HI:.0%}</code> of spot (±15%), focusing on the traded range</li>
+          <li><strong>Call/put merge:</strong> Where both sides exist at the same strike, IV is averaged — put–call parity means they should be equal in theory</li>
+          <li><strong>Smoothing:</strong> Rolling median (window = 5 strikes) per expiry removes isolated bad ticks</li>
+        </ul>
+      </div>
+      <div class="method-box">
+        <h3>Implied Volatility</h3>
+        <p>The <strong>implied volatility (IV)</strong> σ* is the value that makes the Black–Scholes model price equal to the observed market price:</p>
+        <br>
+        <p style="text-align:center; font-style:italic; font-size:0.9rem">
+          C<sub>BS</sub>(S, K, T, r, σ*) = C<sub>market</sub>
+        </p>
+        <br>
+        <p>Rather than inverting this numerically, <code>yfinance</code> returns pre-computed IV directly from the exchange feed, which is faster and avoids numerical instability near expiry.</p>
+        <br>
+        <p><strong>Surface interpolation:</strong> Raw IV points (discrete strikes × expiries) are interpolated onto an 80×40 regular grid using <code>scipy.interpolate.griddata</code> (linear method) to produce the smooth 3-D surface.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- 3D Surface -->
+  <div class="section">
+    <h2>Implied Volatility Surface (3-D)</h2>
+    <div class="subtitle">Drag to rotate · Scroll to zoom · Hover for exact values</div>
+    {html_3d}
+    <hr style="margin: 20px 0 16px">
+    <div class="interp-grid">
+      <div class="interp-box">
+        <div class="tag">What you see</div>
+        <h3>Negative Skew</h3>
+        <p>IV is higher on the left (low strikes = OTM puts) than on the right (OTM calls). This is the classic SPX <em>put skew</em> — investors pay a premium for downside protection, bidding up OTM put prices and therefore their implied volatility.</p>
+      </div>
+      <div class="interp-box">
+        <div class="tag">What you see</div>
+        <h3>Term Structure</h3>
+        <p>IV generally rises moving towards the back of the surface (longer maturities). This reflects the <em>volatility risk premium</em> — uncertainty compounds over time, so longer-dated options carry more implied volatility.</p>
+      </div>
+      <div class="interp-box">
+        <div class="tag">Current reading</div>
+        <h3>Surface Shape</h3>
+        <p>Near-term ATM IV is <strong>{near_atm_iv:.1%}</strong>, rising to <strong>{far_atm_iv:.1%}</strong> at the long end — a {ts_slope} term structure. The put skew of ~<strong>{skew_val:.1%}</strong> (25Δ put vs call) indicates {"elevated hedging demand" if skew_val > 0.03 else "moderate hedging demand"}.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Smile grid -->
+  <div class="section">
+    <h2>Volatility Smile by Expiry</h2>
+    <div class="subtitle">Each panel shows IV across strikes for one expiry · Red star = ATM · X-axis = K/S (1.0 = at-the-money)</div>
+    {html_smile}
+    <hr style="margin: 20px 0 16px">
+    <div class="interp-grid">
+      <div class="interp-box">
+        <div class="tag">How to read</div>
+        <h3>The Skew / Smile</h3>
+        <p>A downward-sloping curve (left higher than right) is a <em>skew</em> — typical for equity indices where put demand exceeds call demand. A U-shaped curve is a true <em>smile</em>, more common in FX and short-dated equity options.</p>
+      </div>
+      <div class="interp-box">
+        <div class="tag">How to read</div>
+        <h3>ATM vs Wings</h3>
+        <p>The red star marks the ATM strike. Points to the left are OTM puts (K &lt; S); points to the right are OTM calls (K &gt; S). The steeper the slope from right to left, the more the market fears a sharp sell-off.</p>
+      </div>
+      <div class="interp-box">
+        <div class="tag">Current reading</div>
+        <h3>Skew across expiries</h3>
+        <p>Short-dated expiries show a steeper left-side slope, meaning near-term tail-risk hedging demand is elevated. Longer-dated smiles flatten — the market prices in mean-reversion over time, reducing the premium for downside protection.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Term structure -->
+  <div class="section">
+    <h2>ATM Term Structure</h2>
+    <div class="subtitle">ATM implied volatility at each expiry — shows how the market prices uncertainty over different horizons</div>
+    {html_ts}
+    <hr style="margin: 20px 0 16px">
+    <div class="interp-grid">
+      <div class="interp-box">
+        <div class="tag">How to read</div>
+        <h3>Contango (upward)</h3>
+        <p>When long-dated IV &gt; short-dated IV the curve is in <em>contango</em>. This is the normal regime — markets expect uncertainty to grow over time and price longer options at a premium.</p>
+      </div>
+      <div class="interp-box">
+        <div class="tag">How to read</div>
+        <h3>Backwardation (inverted)</h3>
+        <p>When short-dated IV &gt; long-dated IV the curve is <em>inverted</em>. This signals elevated near-term fear — often seen around earnings, Fed meetings, or crisis periods — and usually reverts quickly.</p>
+      </div>
+      <div class="interp-box">
+        <div class="tag">Current reading</div>
+        <h3>Today's curve: {ts_slope.split("(")[0].strip().title()}</h3>
+        <p>ATM IV moves from <strong>{near_atm_iv:.1%}</strong> ({atm_df.iloc[0]['days']}d) to <strong>{far_atm_iv:.1%}</strong> ({atm_df.iloc[-1]['days']}d). The {ts_slope} shape suggests {"no immediate event risk priced in — the market is calm and forward-looking" if far_atm_iv > near_atm_iv else "elevated near-term event risk — the market is pricing in an imminent catalyst"}.</p>
+      </div>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>"""
+
+    out = "iv_dashboard.html"
+    with open(out, "w") as f:
+        f.write(html)
+    print(f"Saved → {out}")
+    import webbrowser, os
+    webbrowser.open("file://" + os.path.abspath(out))
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -250,12 +450,9 @@ def main():
     print("  SPX Implied Volatility Surface Model")
     print("=" * 55)
     spot, df = fetch_data()
-    print("\nBuilding plots …")
-    plot_all(spot, df)
-    print("\nDone! Open these files in your browser:")
-    print("  • iv_surface_3d.html")
-    print("  • iv_smile_by_expiry.html")
-    print("  • iv_term_structure.html")
+    print("\nBuilding dashboard …")
+    build_dashboard(spot, df)
+    print("\nDone! Open iv_dashboard.html in your browser.")
 
 if __name__ == "__main__":
     main()
