@@ -1,112 +1,125 @@
 # SPX Equity Implied Volatility Surface Model
 
-A Python tool that pulls **live SPX (S&P 500) options chain data** via `yfinance`, inverts the Black-Scholes formula to extract implied volatility at each strike and maturity, and renders interactive charts showing the full IV surface, per-expiry skew dynamics, and the ATM term structure.
+A Python tool that pulls **SPX (S&P 500 index) option quotes**, cleans them, and **computes implied volatility itself** by inverting Black-76 (Black-Scholes on the forward) on bid/ask mid prices. The risk-free rate comes from the US Treasury curve (FRED) and the forward / dividend yield is implied from put-call parity. It renders a single-page interactive dashboard with the full IV surface, per-expiry skew, and the ATM term structure.
+
+![IV surface](docs/surface.png)
 
 ---
 
-## What It Does
+## Quick start
 
-| Output | Description |
-|---|---|
-| `iv_surface_3d.html` | Interactive 3-D surface — IV plotted across strike (x) and maturity (y) |
-| `iv_smile_by_expiry.html` | Volatility smile / skew for each expiry date |
-| `iv_term_structure.html` | ATM implied volatility as a function of time to expiry |
-
-### Key Features
-- **Live data** — fetches the real-time SPX options chain at runtime via `yfinance`
-- **Black-Scholes inversion** — uses Brent's root-finding method for accurate, fast IV extraction
-- **Liquidity filtering** — removes illiquid strikes (low volume / open interest) that distort the surface
-- **Call-put averaging** — merges call and put IVs at the same strike/expiry for a cleaner surface
-- **Moneyness filter** — restricts the surface to ±25 % of spot (configurable)
-
----
-
-## Setup
-
-### 1. Clone the repo
 ```bash
-git clone https://github.com/<your-username>/spx-iv-surface.git
+git clone https://github.com/spenryhencer/spx-iv-surface.git
 cd spx-iv-surface
-```
-
-### 2. Create a virtual environment (recommended)
-```bash
-python -m venv venv
-source venv/bin/activate        # macOS / Linux
-venv\Scripts\activate           # Windows
-```
-
-### 3. Install dependencies
-```bash
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+python iv_surface.py               # writes iv_dashboard.html and opens it
 ```
+
+Run the tests with `python -m pytest`.
 
 ---
 
-## Usage
+## Data sources
 
-```bash
-python iv_surface.py
-```
+Choose with `--source`:
 
-The script will:
-1. Download the current SPX spot price
-2. Iterate over all available option expiries (up to 12)
-3. Compute implied volatility for each liquid strike
-4. Open three interactive HTML charts in your browser
-5. Save those charts as `.html` files in the current directory
+| Source | Flag | Cost / key | When it works | Notes |
+|---|---|---|---|---|
+| **Cboe delayed quotes** (default) | `--source cboe` | Free, no key | Any time — keeps the last session's closing bid/ask after hours and on weekends | ~15 min delayed. Public but undocumented endpoint, so it may change. Also gives Cboe's own IV, used as a cross-check. |
+| **yfinance** (Yahoo Finance) | `--source yfinance` | Free, no key | **US market hours only** (9:30am–4pm ET) | Outside market hours Yahoo returns `bid = ask = 0` and placeholder IVs; the script detects this and tells you to switch source. |
 
-> **Note:** Markets must be open (or have recently closed) for `yfinance` to return option data. Running outside market hours may return partial or cached data.
-
----
-
-## Configuration
-
-All parameters are at the top of `iv_surface.py`:
-
-| Parameter | Default | Description |
-|---|---|---|
-| `TICKER` | `^SPX` | Underlying ticker |
-| `RISK_FREE_RATE` | `0.05` | Annualised risk-free rate used in BS |
-| `MIN_VOLUME` | `10` | Minimum option volume to include |
-| `MIN_OPEN_INT` | `50` | Minimum open interest to include |
-| `MAX_EXPIRIES` | `12` | Maximum number of expiry dates to process |
-| `MONEYNESS_RANGE` | `(0.75, 1.25)` | Strike range relative to spot |
-
----
-
-## Project Structure
-
-```
-spx-iv-surface/
-├── iv_surface.py        # Main script
-├── requirements.txt     # Python dependencies
-└── README.md            # This file
-```
+Rates: US Treasury constant-maturity yields (1M, 3M, 6M, 1Y, 2Y) from [FRED](https://fred.stlouisfed.org/), no key needed. If FRED is unreachable it falls back to a flat 4% and says so on the dashboard.
 
 ---
 
 ## Methodology
 
-Implied volatility σ* is the value that solves:
+For each selected expiry (nearest available to 14, 21, 30, 45, 60, 90, 120, 180, 270 and 365 days):
 
-```
-C_BS(S, K, T, r, σ*) = C_market
-```
+1. **Clean quotes** — keep two-sided quotes only (`bid > 0`, `ask > bid`), mid ≥ $0.05, relative spread `(ask − bid)/mid ≤ 50%`. Optional `--min-volume` / `--min-oi`. Mid prices are used, never last trade (which can be days stale).
+2. **Rate** — Treasury yield interpolated to the option's maturity, converted to continuous compounding; `DF = e^(−rT)`.
+3. **Forward** — put-call parity at the strikes nearest the money: `F = K + (C_mid − P_mid) / DF`. This gives the implied dividend yield `q = r − ln(F/S)/T` with no dividend forecast needed.
+4. **OTM only** — puts for `K < F`, calls for `K ≥ F` (the liquid side of each strike); strikes within 85%–115% of F.
+5. **Implied vol** — solve `Black76(F, K, T, DF, σ) = mid` with Brent's method; prices outside no-arbitrage bounds are dropped.
+6. **Surface** — each smile is interpolated onto a common K/F grid, then maturities are interpolated linearly in total variance `σ²T`. No smoothing of the market points (optional `--smooth N`).
 
-where `C_BS` is the Black-Scholes call price. Brent's method is used to find σ* numerically, with bounds [0.0001, 10.0] and tolerance 1e-7.
+Time to expiry is measured in calendar time from the quote timestamp to settlement (4:00pm ET for PM-settled SPXW, 9:30am ET for AM-settled SPX monthlies; SPXW is preferred when both exist).
 
-For each (strike, expiry) pair where both a call and a put exist, the two IVs are averaged to reduce bid-ask and model noise (put-call parity ensures they should be equal in theory).
+**Validation:** on the Cboe feed, the median gap between our IVs and Cboe's own published IVs is **0.09 vol points** across ~2,000 quotes (6 Nov 2026 close).
 
 ---
 
-## Requirements
+## Output
 
-- Python 3.10+
-- See `requirements.txt` for package versions
+`iv_dashboard.html` — one self-contained page with:
+
+| Section | What it shows |
+|---|---|
+| Summary cards | Spot, near/long-dated ATM IV, term-structure shape, 30-day 25Δ risk reversal, risk-free rate, implied dividend yield, IV cross-check vs the source |
+| 3-D surface | IV across moneyness (K/F) and maturity |
+| Smile grid | IV vs K/F for each expiry; hover shows strike, put/call and bid/ask |
+| Term structure | ATM-forward IV by days to expiry |
+| Per-expiry table | Rate, forward, dividend yield, ATM IV and point count used for each expiry |
+
+Snapshot from the 6 Nov 2026 close (Cboe feed):
+
+![Smiles](docs/smiles.png)
+![Term structure](docs/term_structure.png)
+
+---
+
+## Command-line options
+
+```
+python iv_surface.py [--source cboe|yfinance] [--moneyness LO HI]
+                     [--max-spread X] [--min-mid X] [--min-volume N] [--min-oi N]
+                     [--smooth N] [--out FILE] [--csv FILE] [--png DIR] [--no-open]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--source` | `cboe` | Data source |
+| `--moneyness` | `0.85 1.15` | K/F range kept |
+| `--max-spread` | `0.5` | Max relative bid/ask spread |
+| `--min-mid` | `0.05` | Min mid price ($) |
+| `--min-volume`, `--min-oi` | `0` | Optional liquidity floors |
+| `--smooth` | `0` | Rolling-median window across strikes (0 = off) |
+| `--out` | `iv_dashboard.html` | Dashboard path |
+| `--csv` | — | Also save the cleaned IV points |
+| `--png` | — | Also save chart PNGs (needs `kaleido` + Google Chrome) |
+| `--no-open` | — | Don't open the browser |
+
+---
+
+## Project structure
+
+```
+spx-iv-surface/
+├── iv_surface.py        # CLI, cleaning + IV pipeline, dashboard
+├── providers.py         # Cboe and yfinance data providers
+├── pricing.py           # Black-76, IV inversion, put-call-parity forward
+├── rates.py             # FRED Treasury curve
+├── tests/               # pytest unit tests
+├── docs/                # screenshots used in this README
+└── requirements.txt
+```
+
+---
+
+## Changelog
+
+**v2 (Nov 2026)**
+- Added the **Cboe delayed-quotes provider** (now the default) alongside yfinance, selectable with `--source`.
+- IV is now **computed in-house** (Black-76 + Brent) from bid/ask mids. v1 plotted Yahoo's pre-computed `impliedVolatility` field, which outside market hours is a placeholder (e.g. 0.00001, 3.1%, 6.25%, 12.5%).
+- Added the Treasury rate curve (FRED), put-call-parity forwards and implied dividend yields.
+- Bid/ask spread and mid-price filters; OTM-only selection; true 25Δ risk reversal; ATM measured at the forward.
+- Surface built per expiry and interpolated in total variance (replaces `griddata` over strike × maturity).
+- CLI options, CSV/PNG export, unit tests.
 
 ---
 
 ## Disclaimer
 
-This project is for **educational purposes only**. It is not financial advice. Options data is sourced from Yahoo Finance and may be delayed or inaccurate.
+This project is for **educational purposes only** and is not financial advice. Quotes are delayed and may be inaccurate.

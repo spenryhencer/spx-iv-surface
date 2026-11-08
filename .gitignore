@@ -31,3 +31,6 @@ Thumbs.db
 # Secrets / keys
 .env
 *.key
+
+# Optional CSV export
+iv_points.csv

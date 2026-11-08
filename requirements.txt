@@ -1,5 +1,12 @@
 yfinance>=0.2.40
+requests>=2.31.0
 numpy>=1.26.0
 pandas>=2.2.0
 scipy>=1.13.0
 plotly>=5.22.0
+
+# Optional: PNG export (--png) needs kaleido + a local Chrome install
+kaleido>=1.0.0
+
+# Tests
+pytest>=8.0.0

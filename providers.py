@@ -14,13 +14,12 @@ for the expiries closest to the requested target maturities.
              works on evenings and weekends. Unofficial endpoint: may change.
 """
 
-import json
-import urllib.request
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import requests
 
 ET          = ZoneInfo("America/New_York")
 MIN_DAYS    = 7          # skip expiries closer than this (IV unstable near expiry)
@@ -108,9 +107,9 @@ def load_yfinance(target_days) -> Chain:
 
 # ── Cboe delayed quotes ──────────────────────────────────────────────────────
 def load_cboe(target_days, timeout=60) -> Chain:
-    req = urllib.request.Request(CBOE_URL, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        payload = json.load(resp)
+    resp = requests.get(CBOE_URL, headers={"User-Agent": USER_AGENT}, timeout=timeout)
+    resp.raise_for_status()
+    payload = resp.json()
     data = payload["data"]
     spot = float(data["current_price"])
     stamp = data.get("last_trade_time") or payload["timestamp"]

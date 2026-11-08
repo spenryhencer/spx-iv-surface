@@ -1,179 +1,206 @@
 """
 Equity Implied Volatility Surface Model
 ========================================
-Fetches live SPX options chain data via yfinance and plots:
+Pulls SPX option quotes (Cboe delayed feed or yfinance), cleans them, and
+computes implied volatility itself by inverting Black-76 on bid/ask mid prices:
+
+  * risk-free rate   — US Treasury curve from FRED, interpolated per expiry
+  * forward / carry  — implied from put-call parity (gives the dividend yield)
+  * IV               — Brent root-finding on out-of-the-money mids
+
+Then renders a single-page dashboard:
   1. Interactive 3-D implied volatility surface (strike x maturity x IV)
   2. Volatility smile / skew per expiry
-  3. ATM term structure
+  3. ATM term structure + per-expiry summary table
 
-Usage:  python3 iv_surface.py
+Usage:  python iv_surface.py [--source cboe|yfinance] [--help for all options]
 """
 
 import warnings
 warnings.filterwarnings("ignore")
 
+import argparse
+import os
 import sys
+import webbrowser
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
-import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime, date
-from scipy.interpolate import griddata
 
-# ── Config ────────────────────────────────────────────────────────────────────
-TICKER          = "^SPX"
-MONEYNESS_LO    = 0.85     # keep strikes ≥ 85% of spot
-MONEYNESS_HI    = 1.15     # keep strikes ≤ 115% of spot
+from pricing import implied_vol, implied_forward, black76_delta
+from providers import PROVIDERS, expiry_datetime
+from rates import fetch_treasury_curve
+
+# ── Config (defaults; most can be overridden on the command line) ─────────────
+MONEYNESS_LO    = 0.85     # keep strikes ≥ 85% of the forward
+MONEYNESS_HI    = 1.15     # keep strikes ≤ 115% of the forward
 MIN_IV          = 0.02     # drop IV below 2%
 MAX_IV          = 1.50     # drop IV above 150%
-MIN_VOLUME      = 5        # require meaningful trading activity
+MAX_REL_SPREAD  = 0.50     # drop quotes with (ask − bid) / mid above this
+MIN_MID         = 0.05     # drop options with a mid price below $0.05
+MIN_VOLUME      = 0        # optional: require traded volume
+MIN_OPEN_INT    = 0        # optional: require open interest
 
 # Target maturities in days — pick the nearest expiry to each target
 TARGET_DAYS     = [14, 21, 30, 45, 60, 90, 120, 180, 270, 365]
+SECONDS_PER_YEAR = 365.0 * 24 * 3600
 
 
-# ── Data fetch ────────────────────────────────────────────────────────────────
-def pick_expiries(all_expiries, today):
-    """Pick the closest available expiry to each target day count."""
-    day_map = {}
-    for exp_str in all_expiries:
-        d = (datetime.strptime(exp_str, "%Y-%m-%d").date() - today).days
-        day_map[exp_str] = d
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description="SPX implied volatility surface dashboard")
+    p.add_argument("--source", choices=sorted(PROVIDERS), default="cboe",
+                   help="options data source (default: cboe)")
+    p.add_argument("--moneyness", nargs=2, type=float, metavar=("LO", "HI"),
+                   default=[MONEYNESS_LO, MONEYNESS_HI], help="K/F range to keep")
+    p.add_argument("--max-spread", type=float, default=MAX_REL_SPREAD,
+                   help="max relative bid/ask spread (ask-bid)/mid")
+    p.add_argument("--min-mid", type=float, default=MIN_MID, help="min mid price ($)")
+    p.add_argument("--min-volume", type=float, default=MIN_VOLUME, help="min traded volume")
+    p.add_argument("--min-oi", type=float, default=MIN_OPEN_INT, help="min open interest")
+    p.add_argument("--smooth", type=int, default=0,
+                   help="rolling-median window across strikes (0 = off)")
+    p.add_argument("--out", default="iv_dashboard.html", help="dashboard HTML path")
+    p.add_argument("--csv", help="also write the cleaned IV points to this CSV")
+    p.add_argument("--png", metavar="DIR", help="also save chart PNGs here (needs kaleido)")
+    p.add_argument("--no-open", action="store_true", help="don't open the browser")
+    return p.parse_args(argv)
 
-    chosen = {}
-    for target in TARGET_DAYS:
-        best = min(day_map, key=lambda e: abs(day_map[e] - target)
-                   if day_map[e] >= 7 else 9999)
-        if day_map.get(best, 0) >= 7:
-            chosen[best] = day_map[best]
 
-    # deduplicate, keep unique expiry strings sorted by days
-    return sorted(set(chosen.keys()), key=lambda e: chosen[e])
+# ── Cleaning + IV computation ─────────────────────────────────────────────────
+def build_iv_points(chain, curve, args):
+    """Clean the quotes, imply forwards, invert Black-76 → (points, per-expiry summary)."""
+    q = chain.quotes
+    q = q[(q["bid"] > 0) & (q["ask"] > q["bid"])].copy()
+    q["mid"]        = 0.5 * (q["bid"] + q["ask"])
+    q["rel_spread"] = (q["ask"] - q["bid"]) / q["mid"]
 
-
-def fetch_data():
-    print(f"Fetching {TICKER} …")
-    tkr  = yf.Ticker(TICKER)
-    hist = tkr.history(period="5d")
-    if hist.empty:
-        raise RuntimeError("Could not get price data — are you online?")
-    spot = float(hist["Close"].dropna().iloc[-1])
-    print(f"  Spot = {spot:,.2f}")
-
-    all_expiries = tkr.options
-    if not all_expiries:
-        raise RuntimeError("No options data returned.")
-
-    today    = date.today()
-    expiries = pick_expiries(all_expiries, today)
-    print(f"Selected {len(expiries)} expiries spread across term structure:")
-
-    records = []
-    for exp_str in expiries:
-        days = (datetime.strptime(exp_str, "%Y-%m-%d").date() - today).days
-        T    = days / 365.0
-        try:
-            chain = tkr.option_chain(exp_str)
-        except Exception as e:
-            print(f"  ✗ {exp_str}: {e}")
+    lo, hi = args.moneyness
+    records, summary = [], []
+    for (exp, root), g in q.groupby(["expiry", "root"]):
+        T = (expiry_datetime(exp, root) - chain.as_of).total_seconds() / SECONDS_PER_YEAR
+        if T <= 0:
             continue
+        r, DF = curve.rate(T), curve.discount(T)
 
-        n_before = len(records)
-        for df_opts in [chain.calls, chain.puts]:
-            df_opts = df_opts.copy()
+        # Forward from put-call parity on strikes with both sides quoted
+        calls = g[g["cp"] == "C"].set_index("strike")["mid"]
+        puts  = g[g["cp"] == "P"].set_index("strike")["mid"]
+        both  = calls.index.intersection(puts.index)
+        F     = implied_forward(both, calls[both], puts[both], DF)
+        if not np.isfinite(F):
+            print(f"  ✗ {exp}: no call/put pairs to imply a forward")
+            continue
+        div_yield = r - np.log(F / chain.spot) / T
 
-            # Require actual trading volume — filters stale/phantom quotes
-            df_opts = df_opts[df_opts["volume"].fillna(0) >= MIN_VOLUME]
+        # Out-of-the-money side only: puts below F, calls at/above F
+        otm = g[((g["cp"] == "P") & (g["strike"] < F)) |
+                ((g["cp"] == "C") & (g["strike"] >= F))].copy()
+        otm["moneyness"] = otm["strike"] / F
+        otm = otm[(otm["moneyness"] >= lo) & (otm["moneyness"] <= hi) &
+                  (otm["rel_spread"] <= args.max_spread) &
+                  (otm["mid"] >= args.min_mid) &
+                  (otm["volume"] >= args.min_volume) &
+                  (otm["open_interest"] >= args.min_oi)]
 
-            # Near-the-money only
-            df_opts = df_opts[
-                (df_opts["strike"] >= spot * MONEYNESS_LO) &
-                (df_opts["strike"] <= spot * MONEYNESS_HI)
-            ]
+        otm["IV"] = [implied_vol(m, F, K, T, DF, cp == "C")
+                     for m, K, cp in zip(otm["mid"], otm["strike"], otm["cp"])]
+        otm = otm[otm["IV"].between(MIN_IV, MAX_IV)]
+        if otm.empty:
+            print(f"  ✗ {exp}: no quotes survived cleaning")
+            continue
+        otm["delta"] = [black76_delta(F, K, T, s, cp == "C")
+                        for K, s, cp in zip(otm["strike"], otm["IV"], otm["cp"])]
 
-            # Valid IV from yfinance
-            df_opts = df_opts[df_opts["impliedVolatility"].notna()]
-            df_opts = df_opts[
-                (df_opts["impliedVolatility"] >= MIN_IV) &
-                (df_opts["impliedVolatility"] <= MAX_IV)
-            ]
+        otm = otm.sort_values("moneyness")
+        if args.smooth > 1:
+            otm["IV"] = otm["IV"].rolling(args.smooth, center=True, min_periods=1).median()
 
-            for _, row in df_opts.iterrows():
-                records.append({
-                    "strike":    row["strike"],
-                    "expiry":    exp_str,
-                    "T":         T,
-                    "days":      days,
-                    "IV":        row["impliedVolatility"],
-                    "moneyness": row["strike"] / spot,
-                })
-
-        print(f"  ✓ {exp_str}  ({days}d  +{len(records)-n_before} pts)")
+        days = (exp - chain.as_of.date()).days
+        otm["expiry"], otm["T"], otm["days"], otm["F"] = str(exp), T, days, F
+        records.append(otm)
+        summary.append({
+            "expiry": str(exp), "root": root, "days": days, "T": T,
+            "rate": r, "forward": F, "div_yield": div_yield,
+            "IV_atm": float(np.interp(1.0, otm["moneyness"], otm["IV"])),
+            "points": len(otm),
+        })
+        print(f"  ✓ {exp} {root:<4} ({days:>3}d  F={F:,.1f}  q={div_yield:5.2%}  +{len(otm)} pts)")
 
     if not records:
-        raise RuntimeError(
-            "No data found.\n"
-            "SPX options data is best during US market hours (9:30am–4pm ET).\n"
-            "Outside those hours, volume=0 on most strikes. Try again then,\n"
-            "or set MIN_VOLUME=0 in the config to use all available quotes."
-        )
+        hint = ("\nYahoo only publishes bid/ask during US market hours (9:30am–4pm ET).\n"
+                "Re-run then, or use the Cboe feed:  python iv_surface.py --source cboe"
+                if "yfinance" in chain.source else
+                "\nTry loosening the filters (e.g. --max-spread 1.0 --min-mid 0).")
+        raise RuntimeError("No usable option quotes after cleaning." + hint)
 
-    df = pd.DataFrame(records)
-    df = (df.groupby(["strike", "expiry", "T", "days", "moneyness"],
-                     as_index=False)
-            .agg(IV=("IV", "mean")))
-    df.sort_values(["T", "strike"], inplace=True)
+    df = pd.concat(records, ignore_index=True)
+    cols = ["expiry", "days", "T", "strike", "cp", "bid", "ask", "mid", "rel_spread",
+            "volume", "open_interest", "F", "moneyness", "IV", "delta", "vendor_iv"]
+    return df[cols], pd.DataFrame(summary).sort_values("T").reset_index(drop=True)
 
-    # Smooth IV per expiry with a rolling median to remove isolated spikes
-    smoothed = []
-    for _, grp in df.groupby("expiry"):
-        grp = grp.sort_values("moneyness").copy()
-        grp["IV"] = grp["IV"].rolling(window=5, center=True, min_periods=1).median()
-        smoothed.append(grp)
-    df = pd.concat(smoothed).reset_index(drop=True)
 
-    print(f"\nTotal points: {len(df)}  across {df['expiry'].nunique()} expiries")
-    return spot, df
+def surface_grid(df, atm_df, n_m=80, n_t=40):
+    """
+    IV on a regular (K/F, T) grid: each smile is interpolated onto a common
+    moneyness grid, then maturities are interpolated linearly in total
+    variance w = σ²T (no-calendar-arbitrage friendly). NaN outside the
+    strike range quoted for that expiry.
+    """
+    m_vals = np.linspace(df["moneyness"].min(), df["moneyness"].max(), n_m)
+    Ts     = atm_df["T"].to_numpy()
+    W      = []
+    for exp, T in zip(atm_df["expiry"], Ts):
+        sub = df[df["expiry"] == exp].sort_values("moneyness")
+        m, iv = sub["moneyness"].to_numpy(), sub["IV"].to_numpy()
+        inside = (m_vals >= m[0]) & (m_vals <= m[-1])
+        W.append(np.where(inside, np.interp(m_vals, m, iv), np.nan) ** 2 * T)
+    W = np.array(W)
+    if len(Ts) == 1:
+        return m_vals, Ts, np.sqrt(W / Ts[:, None])
+    T_vals = np.linspace(Ts[0], Ts[-1], n_t)
+    hi     = np.clip(np.searchsorted(Ts, T_vals), 1, len(Ts) - 1)
+    wgt    = ((T_vals - Ts[hi - 1]) / (Ts[hi] - Ts[hi - 1]))[:, None]
+    Wg     = W[hi - 1] * (1 - wgt) + W[hi] * wgt
+    return m_vals, T_vals, np.sqrt(Wg / T_vals[:, None])
+
+
+def risk_reversal_25d(sub):
+    """IV(25Δ put) − IV(25Δ call) for one expiry, interpolated in delta."""
+    puts  = sub[sub["cp"] == "P"].sort_values("delta")
+    calls = sub[sub["cp"] == "C"].sort_values("delta")
+    if puts.empty or calls.empty:
+        return np.nan
+    if not (puts["delta"].min() <= -0.25 <= puts["delta"].max() and
+            calls["delta"].min() <= 0.25 <= calls["delta"].max()):
+        return np.nan
+    return float(np.interp(-0.25, puts["delta"], puts["IV"]) -
+                 np.interp(0.25, calls["delta"], calls["IV"]))
 
 
 # ── Dashboard builder ─────────────────────────────────────────────────────────
-def build_dashboard(spot, df):
+def build_dashboard(chain, curve, df, atm_df, args):
     from plotly.io import to_html
-    expiries = sorted(df["expiry"].unique(), key=lambda e: df.loc[df["expiry"]==e,"T"].iloc[0])
-    run_time = datetime.now().strftime("%Y-%m-%d %H:%M")
+    spot     = chain.spot
+    expiries = list(atm_df["expiry"])
     n_exp    = len(expiries)
-    atm_ivs  = []
-
-    # ── ATM summary per expiry ────────────────────────────────────────────────
-    atm_rows = []
-    for exp in expiries:
-        sub     = df[df["expiry"] == exp]
-        closest = sub.iloc[(sub["moneyness"] - 1.0).abs().argsort()[:1]]
-        atm_rows.append({
-            "expiry": exp,
-            "days":   int(closest["days"].values[0]),
-            "IV_atm": float(closest["IV"].values[0]),
-        })
-    atm_df = pd.DataFrame(atm_rows).sort_values("days")
+    as_of    = chain.as_of.strftime("%Y-%m-%d %H:%M")
 
     # ── 1. 3-D surface ────────────────────────────────────────────────────────
-    K_vals = np.linspace(df["strike"].min(), df["strike"].max(), 80)
-    T_vals = np.linspace(df["T"].min(),      df["T"].max(),      40)
-    KK, TT = np.meshgrid(K_vals, T_vals)
-    ZZ     = griddata((df["strike"].values, df["T"].values),
-                      df["IV"].values, (KK, TT), method="linear")
+    m_vals, T_vals, ZZ = surface_grid(df, atm_df)
 
     fig3d = go.Figure(go.Surface(
-        x=K_vals, y=T_vals, z=ZZ,
+        x=m_vals, y=T_vals, z=ZZ,
         colorscale="Viridis",
         colorbar=dict(title="IV", tickformat=".0%", x=1.0),
-        hovertemplate="Strike: %{x:,.0f}<br>Maturity: %{y:.2f}y<br>IV: %{z:.1%}<extra></extra>",
+        hovertemplate="K/F: %{x:.3f}<br>Maturity: %{y:.2f}y<br>IV: %{z:.1%}<extra></extra>",
     ))
     fig3d.update_layout(
         title=None,
         scene=dict(
-            xaxis=dict(title="Strike"),
+            xaxis=dict(title="Moneyness (K/F)"),
             yaxis=dict(title="Maturity (years)"),
             zaxis=dict(title="Implied Volatility", tickformat=".0%"),
             camera=dict(eye=dict(x=1.8, y=-1.6, z=0.8)),
@@ -181,9 +208,7 @@ def build_dashboard(spot, df):
         height=620, margin=dict(l=0, r=0, t=10, b=0),
         paper_bgcolor="rgba(0,0,0,0)",
     )
-    plotlyjs = to_html(fig3d, full_html=False, include_plotlyjs=True)
-    # Split out just the <script src> tag plotly injects and the div
-    html_3d = plotlyjs
+    html_3d = to_html(fig3d, full_html=False, include_plotlyjs=True)
 
     # ── 2. Smile grid ─────────────────────────────────────────────────────────
     n_cols     = min(3, n_exp)
@@ -192,26 +217,28 @@ def build_dashboard(spot, df):
                   "#8c564b","#e377c2","#7f7f7f","#bcbd22","#17becf","#aec7e8","#ffbb78"]
     fig_smile  = make_subplots(
         rows=n_rows, cols=n_cols,
-        subplot_titles=[f"{e} ({df.loc[df['expiry']==e,'days'].iloc[0]}d)" for e in expiries],
+        subplot_titles=[f"{e} ({d}d)" for e, d in zip(atm_df["expiry"], atm_df["days"])],
     )
-    for idx, exp in enumerate(expiries):
-        sub = df[df["expiry"] == exp].sort_values("moneyness")
+    for idx, row in atm_df.iterrows():
+        sub = df[df["expiry"] == row["expiry"]].sort_values("moneyness")
         r, c = idx // n_cols + 1, idx % n_cols + 1
         fig_smile.add_trace(go.Scatter(
             x=sub["moneyness"], y=sub["IV"],
             mode="lines+markers", marker=dict(size=4),
             line=dict(color=colors[idx % len(colors)]),
-            name=exp, showlegend=False,
-            hovertemplate="K/S: %{x:.3f}<br>IV: %{y:.1%}<extra></extra>",
+            name=row["expiry"], showlegend=False,
+            customdata=np.c_[sub["strike"], sub["cp"], sub["bid"], sub["ask"]],
+            hovertemplate=("K/F: %{x:.3f} (K=%{customdata[0]:,.0f} %{customdata[1]})"
+                           "<br>Bid/Ask: %{customdata[2]:.2f} / %{customdata[3]:.2f}"
+                           "<br>IV: %{y:.1%}<extra></extra>"),
         ), row=r, col=c)
-        atm = sub.iloc[(sub["moneyness"]-1.0).abs().argsort()[:1]]
         fig_smile.add_trace(go.Scatter(
-            x=atm["moneyness"], y=atm["IV"], mode="markers",
+            x=[1.0], y=[row["IV_atm"]], mode="markers",
             marker=dict(size=9, color="red", symbol="star"),
             showlegend=False,
             hovertemplate="ATM IV: %{y:.1%}<extra></extra>",
         ), row=r, col=c)
-    fig_smile.update_xaxes(title_text="Moneyness (K/S)")
+    fig_smile.update_xaxes(title_text="Moneyness (K/F)")
     fig_smile.update_yaxes(title_text="IV", tickformat=".0%")
     fig_smile.update_layout(height=290 * n_rows, margin=dict(t=40, b=20),
                             paper_bgcolor="rgba(0,0,0,0)")
@@ -229,21 +256,39 @@ def build_dashboard(spot, df):
     ))
     fig_ts.update_layout(
         xaxis=dict(title="Days to Expiry"),
-        yaxis=dict(title="ATM Implied Volatility", tickformat=".0%"),
+        yaxis=dict(title="ATM Implied Volatility", tickformat=".1%"),
         height=380, margin=dict(t=10, b=40),
         paper_bgcolor="rgba(0,0,0,0)",
     )
     html_ts = to_html(fig_ts, full_html=False, include_plotlyjs=False)  # reuses embedded js
 
-    # ── Stats for summary card ────────────────────────────────────────────────
+    if args.png:
+        os.makedirs(args.png, exist_ok=True)
+        for name, fig, w, h in [("surface", fig3d, 1100, 700),
+                                ("smiles", fig_smile, 1200, 290 * n_rows),
+                                ("term_structure", fig_ts, 1000, 420)]:
+            fig = go.Figure(fig).update_layout(paper_bgcolor="white")
+            fig.write_image(os.path.join(args.png, f"{name}.png"), width=w, height=h, scale=2)
+        print(f"Saved PNGs → {args.png}/")
+
+    # ── Stats for summary cards ───────────────────────────────────────────────
     near_atm_iv  = atm_df.iloc[0]["IV_atm"]
     far_atm_iv   = atm_df.iloc[-1]["IV_atm"]
     ts_slope     = "upward (contango)" if far_atm_iv > near_atm_iv else "inverted (backwardation)"
-    skew_exp     = expiries[len(expiries)//2]
-    skew_sub     = df[df["expiry"]==skew_exp]
-    otm_put_iv   = skew_sub[skew_sub["moneyness"] <= 0.95]["IV"].mean()
-    otm_call_iv  = skew_sub[skew_sub["moneyness"] >= 1.05]["IV"].mean()
-    skew_val     = otm_put_iv - otm_call_iv if not np.isnan(otm_put_iv) and not np.isnan(otm_call_iv) else 0
+    rr_row       = atm_df.iloc[(atm_df["days"] - 30).abs().argsort().iloc[0]]
+    skew_val     = risk_reversal_25d(df[df["expiry"] == rr_row["expiry"]])
+    skew_txt     = f"{skew_val:.1%}" if np.isfinite(skew_val) else "n/a"
+    q_row        = atm_df.iloc[(atm_df["days"] - 90).abs().argsort().iloc[0]]
+    vend         = df["vendor_iv"].between(MIN_IV, MAX_IV)
+    iv_gap       = (df.loc[vend, "IV"] - df.loc[vend, "vendor_iv"]).abs().median()
+    iv_gap_txt   = f"{iv_gap * 100:.2f} vol pts" if vend.any() else "n/a"
+    print(f"Median |our IV − vendor IV| = {iv_gap_txt}  ({vend.sum()} points)")
+
+    summary_rows = "\n".join(
+        f"<tr><td>{r.expiry}</td><td>{r.root}</td><td>{r.days}</td><td>{r.rate:.2%}</td>"
+        f"<td>{r.forward:,.1f}</td><td>{r.div_yield:.2%}</td><td>{r.IV_atm:.1%}</td>"
+        f"<td>{r.points}</td></tr>"
+        for r in atm_df.itertuples())
 
     # ── Assemble HTML ─────────────────────────────────────────────────────────
     html = f"""<!DOCTYPE html>
@@ -288,14 +333,23 @@ def build_dashboard(spot, df):
   .tag {{ display: inline-block; background: #e0e7ff; color: #3730a3;
           font-size: 0.72rem; font-weight: 600; padding: 2px 8px;
           border-radius: 99px; margin-bottom: 6px; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 0.84rem; }}
+  th, td {{ padding: 7px 10px; text-align: right; border-bottom: 1px solid #eee; }}
+  th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) {{ text-align: left; }}
+  th {{ color: #888; font-weight: 600; text-transform: uppercase; font-size: 0.72rem; letter-spacing: 0.5px; }}
   hr {{ border: none; border-top: 1px solid #eee; margin: 0; }}
+  @media (max-width: 900px) {{
+    .cards, .interp-grid {{ grid-template-columns: 1fr 1fr; }}
+    .method-grid {{ grid-template-columns: 1fr; }}
+    .container {{ padding: 16px; }}
+  }}
 </style>
 </head>
 <body>
 
 <div class="header">
   <h1>SPX Implied Volatility Surface</h1>
-  <p>Live options chain analysis &nbsp;·&nbsp; Generated {run_time} ET &nbsp;·&nbsp;
+  <p>Source: {chain.source} &nbsp;·&nbsp; Quotes as of {as_of} ET &nbsp;·&nbsp;
      Spot: <strong>{spot:,.2f}</strong> &nbsp;·&nbsp;
      {n_exp} expiries &nbsp;·&nbsp; {len(df):,} data points</p>
 </div>
@@ -324,6 +378,26 @@ def build_dashboard(spot, df):
       <div class="value" style="font-size:1.1rem;padding-top:6px">{ts_slope.split()[0].title()}</div>
       <div class="sub">{ts_slope}</div>
     </div>
+    <div class="card">
+      <div class="label">25Δ Risk Reversal</div>
+      <div class="value">{skew_txt}</div>
+      <div class="sub">put − call IV, {rr_row['days']}d expiry</div>
+    </div>
+    <div class="card">
+      <div class="label">Risk-free rate</div>
+      <div class="value">{curve.rate(q_row['T']):.2%}</div>
+      <div class="sub">{q_row['days']}d · {curve.source} ({curve.asof})</div>
+    </div>
+    <div class="card">
+      <div class="label">Implied dividend yield</div>
+      <div class="value">{q_row['div_yield']:.2%}</div>
+      <div class="sub">{q_row['days']}d · from put–call parity</div>
+    </div>
+    <div class="card">
+      <div class="label">IV check vs vendor</div>
+      <div class="value" style="font-size:1.1rem;padding-top:6px">{iv_gap_txt}</div>
+      <div class="sub">median |our IV − source's IV|</div>
+    </div>
   </div>
 
   <!-- Methodology -->
@@ -334,25 +408,27 @@ def build_dashboard(spot, df):
       <div class="method-box">
         <h3>Data Pipeline</h3>
         <ul>
-          <li><strong>Source:</strong> Live SPX options chain via <code>yfinance</code></li>
-          <li><strong>Expiry selection:</strong> 10 target maturities spread from 14 to 365 days, picking the nearest available expiry to each target so the term structure spans the full curve</li>
-          <li><strong>Liquidity filter:</strong> Only options with <code>volume ≥ {MIN_VOLUME}</code> are used, removing stale/phantom quotes</li>
-          <li><strong>Strike filter:</strong> Moneyness <code>{MONEYNESS_LO:.0%} – {MONEYNESS_HI:.0%}</code> of spot (±15%), focusing on the traded range</li>
-          <li><strong>Call/put merge:</strong> Where both sides exist at the same strike, IV is averaged — put–call parity means they should be equal in theory</li>
-          <li><strong>Smoothing:</strong> Rolling median (window = 5 strikes) per expiry removes isolated bad ticks</li>
+          <li><strong>Source:</strong> {chain.source} (<code>--source {args.source}</code>)</li>
+          <li><strong>Expiry selection:</strong> 10 target maturities from 14 to 365 days, picking the nearest available expiry to each; PM-settled SPXW series are used where both SPX and SPXW exist</li>
+          <li><strong>Quote filter:</strong> two-sided quotes only (<code>bid &gt; 0</code>, <code>ask &gt; bid</code>), mid ≥ <code>${args.min_mid:.2f}</code>, relative spread ≤ <code>{args.max_spread:.0%}</code>{f", volume ≥ <code>{args.min_volume:g}</code>" if args.min_volume else ""}{f", open interest ≥ <code>{args.min_oi:g}</code>" if args.min_oi else ""}</li>
+          <li><strong>Price:</strong> mid = (bid + ask) / 2 — not last trade, which can be hours or days stale</li>
+          <li><strong>OTM only:</strong> puts for K &lt; F, calls for K ≥ F — the liquid side of each strike</li>
+          <li><strong>Strike filter:</strong> moneyness K/F <code>{args.moneyness[0]:.0%} – {args.moneyness[1]:.0%}</code></li>
+          <li><strong>Smoothing:</strong> {f"rolling median over {args.smooth} strikes" if args.smooth > 1 else "none — every point is a market quote"}</li>
         </ul>
       </div>
       <div class="method-box">
         <h3>Implied Volatility</h3>
-        <p>The <strong>implied volatility (IV)</strong> σ* is the value that makes the Black–Scholes model price equal to the observed market price:</p>
-        <br>
-        <p style="text-align:center; font-style:italic; font-size:0.9rem">
-          C<sub>BS</sub>(S, K, T, r, σ*) = C<sub>market</sub>
+        <p>For each expiry, the <strong>rate</strong> r comes from the FRED Treasury curve interpolated to that maturity, and the <strong>forward</strong> from put–call parity at the strikes nearest the money:</p>
+        <p style="text-align:center; font-style:italic; font-size:0.9rem; margin:8px 0">
+          F = K + e<sup>rT</sup>(C<sub>mid</sub> − P<sub>mid</sub>), &nbsp; q = r − ln(F/S)/T
         </p>
-        <br>
-        <p>Rather than inverting this numerically, <code>yfinance</code> returns pre-computed IV directly from the exchange feed, which is faster and avoids numerical instability near expiry.</p>
-        <br>
-        <p><strong>Surface interpolation:</strong> Raw IV points (discrete strikes × expiries) are interpolated onto an 80×40 regular grid using <code>scipy.interpolate.griddata</code> (linear method) to produce the smooth 3-D surface.</p>
+        <p>The <strong>implied volatility</strong> σ* solves the Black-76 equation on that forward, found with Brent's method:</p>
+        <p style="text-align:center; font-style:italic; font-size:0.9rem; margin:8px 0">
+          e<sup>−rT</sup>[F·N(d<sub>1</sub>) − K·N(d<sub>2</sub>)] = C<sub>mid</sub>
+        </p>
+        <p>Using the market-implied forward bakes in dividends without needing a dividend forecast. As a sanity check, our σ* is compared with the source's own IV field (card above).</p>
+        <p style="margin-top:8px"><strong>Surface interpolation:</strong> each smile is interpolated onto a common K/F grid, then maturities are interpolated linearly in total variance σ²T — an 80×40 grid with no smoothing of the market points.</p>
       </div>
     </div>
   </div>
@@ -377,7 +453,7 @@ def build_dashboard(spot, df):
       <div class="interp-box">
         <div class="tag">Current reading</div>
         <h3>Surface Shape</h3>
-        <p>Near-term ATM IV is <strong>{near_atm_iv:.1%}</strong>, rising to <strong>{far_atm_iv:.1%}</strong> at the long end — a {ts_slope} term structure. The put skew of ~<strong>{skew_val:.1%}</strong> (25Δ put vs call) indicates {"elevated hedging demand" if skew_val > 0.03 else "moderate hedging demand"}.</p>
+        <p>Near-term ATM IV is <strong>{near_atm_iv:.1%}</strong>, {"rising" if far_atm_iv > near_atm_iv else "falling"} to <strong>{far_atm_iv:.1%}</strong> at the long end — a {ts_slope} term structure. The {rr_row['days']}d 25Δ risk reversal of <strong>{skew_txt}</strong> (put IV minus call IV) indicates {"elevated hedging demand" if np.isfinite(skew_val) and skew_val > 0.05 else "moderate hedging demand"}.</p>
       </div>
     </div>
   </div>
@@ -385,7 +461,7 @@ def build_dashboard(spot, df):
   <!-- Smile grid -->
   <div class="section">
     <h2>Volatility Smile by Expiry</h2>
-    <div class="subtitle">Each panel shows IV across strikes for one expiry · Red star = ATM · X-axis = K/S (1.0 = at-the-money)</div>
+    <div class="subtitle">Each panel shows IV across strikes for one expiry · Red star = ATM (K = F) · X-axis = K/F (1.0 = at-the-money forward)</div>
     {html_smile}
     <hr style="margin: 20px 0 16px">
     <div class="interp-grid">
@@ -397,12 +473,12 @@ def build_dashboard(spot, df):
       <div class="interp-box">
         <div class="tag">How to read</div>
         <h3>ATM vs Wings</h3>
-        <p>The red star marks the ATM strike. Points to the left are OTM puts (K &lt; S); points to the right are OTM calls (K &gt; S). The steeper the slope from right to left, the more the market fears a sharp sell-off.</p>
+        <p>The red star marks the at-the-money forward. Points to the left are OTM puts (K &lt; F); points to the right are OTM calls (K &gt; F). The steeper the slope from right to left, the more the market fears a sharp sell-off.</p>
       </div>
       <div class="interp-box">
-        <div class="tag">Current reading</div>
+        <div class="tag">How to read</div>
         <h3>Skew across expiries</h3>
-        <p>Short-dated expiries show a steeper left-side slope, meaning near-term tail-risk hedging demand is elevated. Longer-dated smiles flatten — the market prices in mean-reversion over time, reducing the premium for downside protection.</p>
+        <p>Short-dated smiles are usually steeper in K/F terms because a given % move is a bigger shock over a short horizon; longer-dated smiles look flatter, though the skew per unit of √T is often similar.</p>
       </div>
     </div>
   </div>
@@ -410,7 +486,7 @@ def build_dashboard(spot, df):
   <!-- Term structure -->
   <div class="section">
     <h2>ATM Term Structure</h2>
-    <div class="subtitle">ATM implied volatility at each expiry — shows how the market prices uncertainty over different horizons</div>
+    <div class="subtitle">ATM-forward implied volatility at each expiry — shows how the market prices uncertainty over different horizons</div>
     {html_ts}
     <hr style="margin: 20px 0 16px">
     <div class="interp-grid">
@@ -432,27 +508,53 @@ def build_dashboard(spot, df):
     </div>
   </div>
 
+  <!-- Expiry summary -->
+  <div class="section">
+    <h2>Per-Expiry Inputs</h2>
+    <div class="subtitle">Rate, implied forward and dividend yield used for each expiry, with the resulting ATM IV</div>
+    <table>
+      <tr><th>Expiry</th><th>Root</th><th>Days</th><th>Rate r</th><th>Forward F</th><th>Div. yield q</th><th>ATM IV</th><th>Points</th></tr>
+      {summary_rows}
+    </table>
+  </div>
+
 </div>
 </body>
 </html>"""
 
-    out = "iv_dashboard.html"
-    with open(out, "w") as f:
+    with open(args.out, "w") as f:
         f.write(html)
-    print(f"Saved → {out}")
-    import webbrowser, os
-    webbrowser.open("file://" + os.path.abspath(out))
+    print(f"Saved → {args.out}")
+    if not args.no_open:
+        webbrowser.open("file://" + os.path.abspath(args.out))
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-def main():
+def main(argv=None):
+    args = parse_args(argv)
     print("=" * 55)
     print("  SPX Implied Volatility Surface Model")
     print("=" * 55)
-    spot, df = fetch_data()
+    print(f"Fetching SPX options from {args.source} …")
+    chain = PROVIDERS[args.source](TARGET_DAYS)
+    print(f"  Spot = {chain.spot:,.2f}   quotes as of {chain.as_of:%Y-%m-%d %H:%M} ET")
+    curve = fetch_treasury_curve(chain.as_of.date())
+    print(f"  Rates: {curve.source} as of {curve.asof}")
+
+    print("Computing implied vols:")
+    try:
+        df, atm_df = build_iv_points(chain, curve, args)
+    except RuntimeError as e:
+        sys.exit(f"\n✗ {e}")
+    print(f"\nTotal points: {len(df)}  across {len(atm_df)} expiries")
+    if args.csv:
+        df.to_csv(args.csv, index=False)
+        print(f"Saved points → {args.csv}")
+
     print("\nBuilding dashboard …")
-    build_dashboard(spot, df)
-    print("\nDone! Open iv_dashboard.html in your browser.")
+    build_dashboard(chain, curve, df, atm_df, args)
+    print(f"\nDone! Open {args.out} in your browser.")
+
 
 if __name__ == "__main__":
     main()

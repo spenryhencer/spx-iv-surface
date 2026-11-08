@@ -6,11 +6,11 @@ interpolated in maturity and converted to continuous compounding.
 """
 
 import io
-import urllib.request
 from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
+import requests
 
 FRED_CSV      = "https://fred.stlouisfed.org/graph/fredgraph.csv"
 TENORS        = {"DGS1MO": 1/12, "DGS3MO": 0.25, "DGS6MO": 0.5, "DGS1": 1.0, "DGS2": 2.0}
@@ -38,8 +38,9 @@ def fetch_treasury_curve(asof: date, timeout=15) -> RateCurve:
     start = (asof - timedelta(days=14)).isoformat()
     url   = f"{FRED_CSV}?id={','.join(TENORS)}&cosd={start}&coed={asof.isoformat()}"
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
-            df = pd.read_csv(io.StringIO(resp.read().decode()))
+        resp = requests.get(url, timeout=timeout)
+        resp.raise_for_status()
+        df = pd.read_csv(io.StringIO(resp.text))
         df = df.set_index(df.columns[0])[list(TENORS)]
         df = df.apply(pd.to_numeric, errors="coerce").dropna()
         if df.empty:
