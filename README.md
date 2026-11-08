@@ -6,25 +6,48 @@ A Python tool that pulls **SPX (S&P 500 index) option quotes**, cleans them, and
 
 ---
 
-## Quick start
+## How to Open the Dashboard
 
-**Easiest (Mac):** double-click `run.command` in Finder. The first run sets everything up (about a minute). It then opens the live dashboard at <http://localhost:8501>. Close the Terminal window to stop it.
+There are two ways to view it. Both build from SPX option quotes at run time, so nothing is stored in this repo. You generate it locally, and the first time takes about a minute.
 
-**From Terminal:**
-
+### 1. Get the code
 ```bash
 git clone https://github.com/spenryhencer/spx-iv-surface.git
 cd spx-iv-surface
-python3 -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-streamlit run app.py               # live app at http://localhost:8501
-python iv_surface.py               # or: one-off static iv_dashboard.html
 ```
+Or click **Code → Download ZIP** on this page and unzip it.
 
-The **live app** (`app.py`) re-fetches quotes every 5 minutes (or press *Refresh now*), and lets you switch source and adjust filters from the sidebar. It also has tabs for the surface, smiles, term structure, per-expiry inputs, and the raw data with CSV download.
+### 2a. Easiest on a Mac: double-click `run.command`
+In Finder, double-click `run.command` in the project folder. The first run creates the Python environment and installs everything. It then opens the **live dashboard** at <http://localhost:8501>. Close the Terminal window to stop it.
 
-**Market hours:** when the quotes are more than 30 minutes old (evenings, weekends, holidays), both outputs show a *"Market closed / stale data — quotes as of …"* banner. The charts then show the last session's closing quotes.
+### 2b. From Terminal
+Install (first time only):
+```bash
+python3 -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+```
+Then either run the live app:
+```bash
+streamlit run app.py             # opens http://localhost:8501
+```
+or build a one-off static page:
+```bash
+python iv_surface.py             # writes iv_dashboard.html and opens it
+```
+To reopen the last static dashboard without pulling new data, open `iv_dashboard.html` in the project folder (double-click it, or run `open iv_dashboard.html` on macOS).
+
+The **live app** (`app.py`) re-fetches quotes every 5 minutes (or press *Refresh now*). From the sidebar you can switch data source, switch the smile x-axis between % of forward and SPX strike, and adjust filters. It has tabs for the surface, smiles, term structure, per-expiry inputs, and the raw data with CSV download.
+
+### Useful options (static page)
+| Command | What it does |
+|---|---|
+| `python iv_surface.py --source yfinance` | Use Yahoo Finance instead of the default Cboe delayed quotes |
+| `python iv_surface.py --csv iv_points.csv` | Also save the cleaned IV points to a CSV |
+| `python iv_surface.py --no-open` | Build the page without opening the browser |
+| `python iv_surface.py --help` | List every option, including the quote-filtering thresholds |
+
+> **Note:** quotes only update while US markets are open (Mon–Fri, 9:30am–4pm New York time). Outside those hours the dashboard shows a *"Market closed / stale data — quotes as of …"* banner. The Cboe source (default) then shows the last session's closing quotes; yfinance has no usable quotes until the market reopens.
 
 Run the tests with `python -m pytest`.
 
