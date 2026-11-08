@@ -8,14 +8,23 @@ A Python tool that pulls **SPX (S&P 500 index) option quotes**, cleans them, and
 
 ## Quick start
 
+**Easiest (Mac):** double-click `run.command` in Finder. The first run sets everything up (about a minute). It then opens the live dashboard at <http://localhost:8501>. Close the Terminal window to stop it.
+
+**From Terminal:**
+
 ```bash
 git clone https://github.com/spenryhencer/spx-iv-surface.git
 cd spx-iv-surface
 python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-python iv_surface.py               # writes iv_dashboard.html and opens it
+streamlit run app.py               # live app at http://localhost:8501
+python iv_surface.py               # or: one-off static iv_dashboard.html
 ```
+
+The **live app** (`app.py`) re-fetches quotes every 5 minutes (or press *Refresh now*), and lets you switch source and adjust filters from the sidebar. It also has tabs for the surface, smiles, term structure, per-expiry inputs, and the raw data with CSV download.
+
+**Market hours:** when the quotes are more than 30 minutes old (evenings, weekends, holidays), both outputs show a *"Market closed / stale data — quotes as of …"* banner. The charts then show the last session's closing quotes.
 
 Run the tests with `python -m pytest`.
 
@@ -43,7 +52,8 @@ For each selected expiry (nearest available to 14, 21, 30, 45, 60, 90, 120, 180,
 3. **Forward** — put-call parity at the strikes nearest the money: `F = K + (C_mid − P_mid) / DF`. This gives the implied dividend yield `q = r − ln(F/S)/T` with no dividend forecast needed.
 4. **OTM only** — puts for `K < F`, calls for `K ≥ F` (the liquid side of each strike); strikes within 85%–115% of F.
 5. **Implied vol** — solve `Black76(F, K, T, DF, σ) = mid` with Brent's method; prices outside no-arbitrage bounds are dropped.
-6. **Surface** — each smile is interpolated onto a common K/F grid, then maturities are interpolated linearly in total variance `σ²T`. No smoothing of the market points (optional `--smooth N`).
+6. **Dropped points are reported, never plotted** — each expiry's table row shows how many quotes were dropped for bad quotes (zero bid, crossed or wide spread, below liquidity floors), failed inversions (price outside no-arbitrage bounds) or implausible IVs (outside 2%–150%).
+7. **Surface** — each smile is interpolated onto a common K/F grid, then maturities are interpolated linearly in total variance `σ²T`. No smoothing of the market points (optional `--smooth N`).
 
 Time to expiry is measured in calendar time from the quote timestamp to settlement (4:00pm ET for PM-settled SPXW, 9:30am ET for AM-settled SPX monthlies; SPXW is preferred when both exist).
 
@@ -61,7 +71,7 @@ Time to expiry is measured in calendar time from the quote timestamp to settleme
 | 3-D surface | IV across moneyness (K/F) and maturity |
 | Smile grid | IV vs K/F for each expiry; hover shows strike, put/call and bid/ask |
 | Term structure | ATM-forward IV by days to expiry |
-| Per-expiry table | Rate, forward, dividend yield, ATM IV and point count used for each expiry |
+| Per-expiry table | Rate, forward, dividend yield, ATM IV, points used and points dropped (by reason) for each expiry |
 
 Snapshot from the 6 Nov 2026 close (Cboe feed):
 
@@ -97,7 +107,9 @@ python iv_surface.py [--source cboe|yfinance] [--moneyness LO HI]
 
 ```
 spx-iv-surface/
-├── iv_surface.py        # CLI, cleaning + IV pipeline, dashboard
+├── app.py               # Streamlit live app
+├── run.command          # double-click launcher (macOS)
+├── iv_surface.py        # CLI, cleaning + IV pipeline, figures, static dashboard
 ├── providers.py         # Cboe and yfinance data providers
 ├── pricing.py           # Black-76, IV inversion, put-call-parity forward
 ├── rates.py             # FRED Treasury curve
@@ -117,6 +129,8 @@ spx-iv-surface/
 - Bid/ask spread and mid-price filters; OTM-only selection; true 25Δ risk reversal; ATM measured at the forward.
 - Surface built per expiry and interpolated in total variance (replaces `griddata` over strike × maturity).
 - CLI options, CSV/PNG export, unit tests.
+- Streamlit live app (`app.py`) with 5-minute refresh, plus a `run.command` launcher.
+- "Market closed / stale data" banner, dropped-point counts by reason, and clearer axis labels (strike as % of forward, days to expiry, bid/ask/mid on hover).
 
 ---
 
