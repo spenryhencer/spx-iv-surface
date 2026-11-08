@@ -214,8 +214,14 @@ def fmt_expiry(exp, days):
     return f"{datetime.strptime(exp, '%Y-%m-%d'):%d %b %Y} · {days} days"
 
 
-def make_figures(df, atm_df):
-    """Return the three Plotly figures: 3-D surface, smile grid, term structure."""
+def make_figures(df, atm_df, x_axis="moneyness"):
+    """
+    Return the three Plotly figures: 3-D surface, smile grid, term structure.
+    x_axis: "moneyness" (strike as % of forward) or "strike" (SPX index level)
+    for the smile panels.
+    """
+    by_strike = x_axis == "strike"
+    axis_font = dict(size=13)
     # ── 1. 3-D surface ────────────────────────────────────────────────────────
     m_vals, T_vals, ZZ = surface_grid(df, atm_df)
     fig3d = go.Figure(go.Surface(
@@ -228,9 +234,9 @@ def make_figures(df, atm_df):
     fig3d.update_layout(
         title=None,
         scene=dict(
-            xaxis=dict(title="Strike (% of forward)", tickformat=".0%"),
-            yaxis=dict(title="Days to expiry"),
-            zaxis=dict(title="Implied volatility", tickformat=".0%"),
+            xaxis=dict(title=dict(text="Strike (% of forward)", font=axis_font), tickformat=".0%"),
+            yaxis=dict(title=dict(text="Days to expiry", font=axis_font)),
+            zaxis=dict(title=dict(text="Implied volatility", font=axis_font), tickformat=".0%"),
             camera=dict(eye=dict(x=1.8, y=-1.6, z=0.8)),
         ),
         height=620, margin=dict(l=0, r=0, t=10, b=0),
@@ -252,28 +258,34 @@ def make_figures(df, atm_df):
         r, c = idx // n_cols + 1, idx % n_cols + 1
         side = np.where(sub["cp"] == "C", "call", "put")
         fig_smile.add_trace(go.Scatter(
-            x=sub["moneyness"], y=sub["IV"],
+            x=sub["strike"] if by_strike else sub["moneyness"], y=sub["IV"],
             mode="lines+markers", marker=dict(size=4),
             line=dict(color=colors[idx % len(colors)]),
             name=row["expiry"], showlegend=False,
             customdata=np.c_[sub["strike"], side, sub["bid"], sub["ask"], sub["mid"]],
-            hovertemplate=("Strike %{customdata[0]:,.0f} %{customdata[1]} (%{x:.1%} of forward)"
+            text=sub["moneyness"],
+            hovertemplate=("Strike %{customdata[0]:,.0f} %{customdata[1]} (%{text:.1%} of forward)"
                            "<br>Bid %{customdata[2]:.2f} · Ask %{customdata[3]:.2f}"
                            " · Mid %{customdata[4]:.2f}"
                            "<br>Implied vol: %{y:.1%}<extra></extra>"),
         ), row=r, col=c)
         fig_smile.add_trace(go.Scatter(
-            x=[1.0], y=[row["IV_atm"]], mode="markers",
+            x=[row["forward"] if by_strike else 1.0], y=[row["IV_atm"]], mode="markers",
             marker=dict(size=9, color="red", symbol="star"),
             showlegend=False,
-            hovertemplate="At-the-money implied vol: %{y:.1%}<extra></extra>",
+            hovertemplate=(f"At-the-money (forward {row['forward']:,.0f})"
+                           "<br>Implied vol: %{y:.1%}<extra></extra>"),
         ), row=r, col=c)
-        fig_smile.add_vline(x=1.0, line=dict(color="#bbb", dash="dot", width=1), row=r, col=c)
-    fig_smile.update_xaxes(title_text="Strike (% of forward)", tickformat=".0%",
-                           title_font=dict(size=11))
-    fig_smile.update_yaxes(title_text="Implied vol", tickformat=".0%",
-                           title_font=dict(size=11))
-    fig_smile.update_layout(height=300 * n_rows, margin=dict(t=40, b=20),
+        fig_smile.add_vline(x=row["forward"] if by_strike else 1.0, line=dict(color="#bbb", dash="dot", width=1), row=r, col=c)
+    if by_strike:
+        fig_smile.update_xaxes(title_text="Strike (SPX index level)", tickformat=",.0f",
+                               title_font=axis_font)
+    else:
+        fig_smile.update_xaxes(title_text="Strike (% of forward)", tickformat=".0%",
+                               title_font=axis_font)
+    fig_smile.update_yaxes(title_text="Implied volatility", tickformat=".0%",
+                           title_font=axis_font)
+    fig_smile.update_layout(height=300 * n_rows, margin=dict(t=40, b=60),
                             paper_bgcolor="rgba(0,0,0,0)")
 
     # ── 3. Term structure ─────────────────────────────────────────────────────
@@ -287,8 +299,9 @@ def make_figures(df, atm_df):
         name="ATM IV",
     ))
     fig_ts.update_layout(
-        xaxis=dict(title="Days to expiry"),
-        yaxis=dict(title="At-the-money implied volatility", tickformat=".1%"),
+        xaxis=dict(title=dict(text="Days to expiry", font=axis_font)),
+        yaxis=dict(title=dict(text="At-the-money implied volatility", font=axis_font),
+                   tickformat=".1%"),
         height=380, margin=dict(t=10, b=40),
         paper_bgcolor="rgba(0,0,0,0)",
     )

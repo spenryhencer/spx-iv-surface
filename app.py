@@ -36,6 +36,11 @@ with st.sidebar:
         get_surface.clear()
     st.caption(f"Auto-refreshes every {REFRESH_SECONDS // 60} min.")
 
+    st.header("Chart")
+    x_axis = st.radio("Smile x-axis", ["moneyness", "strike"],
+                      format_func={"moneyness": "Strike as % of forward",
+                                   "strike": "Strike (SPX index level)"}.get)
+
     st.header("Filters")
     moneyness  = st.slider("Strike range (% of forward)", 0.70, 1.30, (0.85, 1.15), 0.01)
     max_spread = st.slider("Max bid/ask spread (% of mid)", 0.05, 1.00, 0.50, 0.05)
@@ -71,15 +76,18 @@ c[2].metric(f"Implied dividend yield · {s['q_row']['days']}d", f"{s['q_row']['d
 c[3].metric("IV check vs source", s["iv_gap_txt"], "median |ours − source|", delta_color="off")
 
 # ── Charts ────────────────────────────────────────────────────────────────────
-figs = make_figures(df, atm_df)
+figs = make_figures(df, atm_df, x_axis)
 tab_surf, tab_smile, tab_ts, tab_inputs, tab_data = st.tabs(
     ["3-D surface", "Smiles by expiry", "Term structure", "Per-expiry inputs", "Data"])
 
 with tab_surf:
     st.plotly_chart(figs["surface"], width="stretch")
 with tab_smile:
-    st.caption("X-axis: strike as a % of each expiry's forward (100% = at the money). "
-               "Y-axis: implied vol from the bid/ask mid. Hover a point for its bid, ask and mid.")
+    st.caption(("X-axis: strike in SPX index points; the dotted line is that expiry's forward price. "
+                if x_axis == "strike" else
+                "X-axis: strike as a % of each expiry's forward (100% = at the money, dotted line). ")
+               + "Y-axis: implied vol from the bid/ask mid. Red star = at-the-money. "
+                 "Hover a point for its strike, bid, ask and mid. Switch the x-axis in the sidebar.")
     st.plotly_chart(figs["smiles"], width="stretch")
 with tab_ts:
     st.plotly_chart(figs["term_structure"], width="stretch")
